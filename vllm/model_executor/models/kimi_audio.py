@@ -31,7 +31,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.moonaudio import MoonshotKimiaModel
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
-from vllm.transformers_utils.tokenizers.tiktoken import TikTokenTokenizer
+from vllm.tokenizers.tiktoken import TikTokenTokenizer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
@@ -313,14 +313,35 @@ class MoonshotKimiaForCausalLM(
         whisper_input_feature = audio_input["whisper_input_feature"]
         is_continuous_mask = audio_input["is_continuous_mask"]
         is_continuous_mask = torch.tensor([is_continuous_mask], dtype=torch.bool)
-        whisper_input_feature = self.audio_tower.tokenize_waveform(
-            whisper_input_feature
-        )
-        whisper_input_feature = whisper_input_feature.reshape(
-            whisper_input_feature.shape[0],
-            int(whisper_input_feature.shape[1] // 4),
-            whisper_input_feature.shape[2] * 4,
-        )
+
+        # Load audio from paths if needed (in worker process, safe to use ffmpeg)
+        # and extract whisper features
+        if whisper_input_feature and isinstance(whisper_input_feature[0], str):
+            from vllm.transformers_utils.processors.kimi_audio import load_audio
+            processed_features = []
+            for audio_path in whisper_input_feature:
+                # Load audio using ffmpeg (no fork issues)
+                audio_data = load_audio(audio_path)
+                audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
+                # Extract whisper features
+                feature = self.audio_tower.tokenize_waveform(audio_tensor)
+                feature = feature.reshape(
+                    feature.shape[0],
+                    int(feature.shape[1] // 4),
+                    feature.shape[2] * 4,
+                )
+                processed_features.append(feature)
+            whisper_input_feature = processed_features
+        else:
+            # Features already provided, just process them
+            whisper_input_feature = self.audio_tower.tokenize_waveform(
+                whisper_input_feature
+            )
+            whisper_input_feature = whisper_input_feature.reshape(
+                whisper_input_feature.shape[0],
+                int(whisper_input_feature.shape[1] // 4),
+                whisper_input_feature.shape[2] * 4,
+            )
 
         # shape: batch, seq_len, hidden_size
         device = self.language_model.embed_tokens.weight.device

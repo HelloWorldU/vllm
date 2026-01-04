@@ -18,13 +18,6 @@ from transformers.models.whisper.modeling_whisper import WhisperModel
 from transformers.processing_utils import ProcessingKwargs
 from transformers.tokenization_utils_base import TextInput
 
-from vllm.utils import PlaceholderModule
-
-try:
-    import librosa
-except ImportError:
-    librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
-
 # hard-coded audio hyperparameters
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -302,9 +295,10 @@ class KimiAContent:
         self.audio_token_loss_mask: list[int] = audio_token_loss_mask or []
         self.text_token_loss_mask: list[int] = text_token_loss_mask or []
 
-        # Storage raw audio consists of sampling rate and raw audio data
-        self.audios: list[np.ndarray] = []
-        self.continuous_feature: list[np.ndarray] = []
+        # Storage audio paths (not loaded data to avoid fork issues)
+        self.audios: list[str] = []
+        # Whisper features will be extracted in worker process
+        self.continuous_feature: list[str] = []
 
     def audio_append(
         self,
@@ -452,12 +446,13 @@ class KimiAudioProcessor:
             return self.text_tokenizer(text,
                                        add_special_tokens=False)["input_ids"]
 
-    def _get_raw_audio(self,
-                       audio_path: str) -> dict[str, Union[str, np.ndarray]]:
-        audios = {"path": audio_path}
-        audio_data: np.ndarray = librosa.load(**audios, sr=16000)[0]
-        audios["data"] = audio_data
-        return audios
+    def _get_audio_path(self, audio_path: str) -> str:
+        """
+        Return the audio path without loading the actual data.
+        Audio loading will be deferred to worker process to avoid fork issues
+        with librosa and other audio libraries.
+        """
+        return audio_path
 
     def _tokenize_audio(self, audio_path: str) -> list[int]:
         # handle audio placeholder here, using sequence
@@ -503,15 +498,6 @@ class KimiAudioProcessor:
 
         return total_tokens
 
-    def get_audio_waves(self, audio: Union[str, AUDIO_TYPE]) -> np.ndarray:
-        if isinstance(audio, str):
-            wav_array = librosa.load(audio, sr=16000)[0]
-        elif isinstance(audio, AUDIO_TYPE):
-            wav_array = audio
-        else:
-            raise ValueError(f"Invalid wav type: {type(audio)}")
-        wav_array = cast(np.ndarray, wav_array)
-        return wav_array
 
     def tokenize_message(
         self,
@@ -567,10 +553,12 @@ class KimiAudioProcessor:
             if not isinstance(audio_path, str):
                 raise ValueError("Expected 'content' to be a string")
 
-            audio = self._get_raw_audio(audio_path)
-            speech_tokens = self._tokenize_audio(audio["path"])
+            # Don't load audio data here to avoid librosa fork issues
+            # Just use the path and create placeholder tokens
+            speech_tokens = self._tokenize_audio(audio_path)
 
-            kimia_content_msg.audios.append(audio["data"])
+            # Store audio path (not loaded data)
+            kimia_content_msg.audios.append(audio_path)
             kimia_content_msg.audio_append(self.extra_tokens.media_begin)
             kimia_content_msg.audio_extend(
                 speech_tokens,
@@ -594,15 +582,15 @@ class KimiAudioProcessor:
                 kimia_content_msg.text_append(
                     self.extra_tokens.kimia_text_blank)
 
+            # Whisper feature extraction will be done in worker process
+            # Store path for later processing
             if extract_whisper_feature:
-                audio_waves = self.get_audio_waves(audio["data"])
-                kimia_content_msg.continuous_feature.append(audio_waves)
+                kimia_content_msg.continuous_feature.append(audio_path)
 
         # Not support currently, as official library does utilize this branch
         elif message["message_type"] == "audio-text":
             audio_path, text = message["content"]
-            audio = self._get_raw_audio(audio_path)
-            speech_tokens = self._tokenize_audio(audio)
+            speech_tokens = self._tokenize_audio(audio_path)
             text_tokens = self._tokenize_text(text)
 
             kimia_content_msg.audio_extend(
@@ -634,17 +622,18 @@ class KimiAudioProcessor:
     def handle_prompt(self, messages: KimiAContent) -> dict:
         audio_input_ids, text_input_ids, is_continuous_mask, _, _ = (
             messages.to_tensor())
-        audio_input_items: list[np.ndarray] = messages.audios
-        audio_features: list[np.ndarray] = messages.continuous_feature
+        audio_paths: list[str] = messages.audios
+        whisper_feature_paths: list[str] = messages.continuous_feature
 
-        # Consturct text prompt ids, mm_data and mm_processor_kwargs
+        # Construct text prompt ids, mm_data and mm_processor_kwargs
+        # Pass audio paths (not loaded data) to avoid fork issues
         text_input_ids = text_input_ids.cpu().tolist()
-        mm_data = audio_input_items
+        mm_data = audio_paths
         mm_processor_kwargs = dict(
             audio_input_ids=audio_input_ids.cpu().tolist(),
             text_input_ids=text_input_ids,
             is_continuous_mask=is_continuous_mask.cpu().tolist(),
-            whisper_input_feature=[torch.as_tensor(f) for f in audio_features],
+            whisper_input_feature=whisper_feature_paths,
         )
 
         return {

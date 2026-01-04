@@ -34,14 +34,7 @@ from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
-from vllm.utils import PlaceholderModule
-
 from vllm.transformers_utils.configs import WhisperVQConfig
-
-try:
-    import librosa
-except ImportError:
-    librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
 logger = logging.get_logger(__name__)
 
@@ -1098,9 +1091,18 @@ class Glm4Tokenizer(nn.Module):
                 self.tokenizer_path)
 
         if audio_path:
-            audio, sr = librosa.load(audio_path, sr=16000)
-            audio = torch.tensor(audio).unsqueeze(0)
-            audio_info = (audio, sr)
+            # Use torchaudio instead of librosa to avoid fork issues
+            audio, orig_sr = torchaudio.load(audio_path)
+            # Resample if necessary
+            if orig_sr != 16000:
+                if orig_sr not in _resample_buffer:
+                    _resample_buffer[orig_sr] = torchaudio.transforms.Resample(
+                        orig_freq=orig_sr, new_freq=16000)
+                audio = _resample_buffer[orig_sr](audio)
+            # Take first channel if stereo
+            if audio.shape[0] > 1:
+                audio = audio[:1]
+            audio_info = (audio, 16000)
         else:
             assert speech is not None
             assert sr
