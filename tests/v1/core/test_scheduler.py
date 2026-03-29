@@ -4328,8 +4328,10 @@ def test_jump_forward_tokens_stop_eos():
     # Should stop at EOS — token 102 must NOT appear.
     assert list(req.output_token_ids) == [7, 100, EOS_TOKEN_ID]
     assert req.status == RequestStatus.FINISHED_STOPPED
-    # Stored ff_tokens should be truncated to what was actually used.
-    assert scheduler.pending_ff_tokens[req.request_id] == [100, EOS_TOKEN_ID]
+    # Stopped request must NOT leave orphan pending_ff_tokens.
+    assert req.request_id not in scheduler.pending_ff_tokens
+    # Stopped request must be removed from the running queue.
+    assert req not in scheduler.running
 
 
 def test_jump_forward_tokens_stop_max_tokens():
@@ -4374,7 +4376,10 @@ def test_jump_forward_tokens_stop_max_tokens():
     # 1 sampled + 2 ff = 3 = max_tokens → length capped.
     assert list(req.output_token_ids) == [7, 100, 101]
     assert req.status == RequestStatus.FINISHED_LENGTH_CAPPED
-    assert scheduler.pending_ff_tokens[req.request_id] == [100, 101]
+    # Stopped request must NOT leave orphan pending_ff_tokens.
+    assert req.request_id not in scheduler.pending_ff_tokens
+    # Stopped request must be removed from the running queue.
+    assert req not in scheduler.running
 
 
 def test_jump_forward_tokens_retained_for_unscheduled_requests():

@@ -1420,23 +1420,6 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            routed_experts = None
-            finish_reason = None
-            if stopped:
-                routed_experts = self._get_routed_experts(request)
-
-                # Capture finish_reason BEFORE _handle_stopped_request, which may
-                # reset the status to WAITING for streaming requests that continue.
-                finish_reason = request.get_finished_reason()
-                finished = self._handle_stopped_request(request)
-                if finished:
-                    kv_transfer_params = self._free_request(request)
-
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
-                else:
-                    stopped_preempted_reqs.add(request)
-
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
@@ -1465,17 +1448,13 @@ class Scheduler(SchedulerInterface):
                     ff_tokens = struct_output_request.grammar.advance_ff_tokens()
 
                     if ff_tokens:
-                        # Append ff_tokens one by one, checking stop
-                        # conditions after each token (matching the
-                        # behavior in _update_request_with_output).
-                        for i, tok in enumerate(ff_tokens):
-                            request.append_output_token_ids(tok)
-                            new_token_ids.append(tok)
-                            stopped = check_stop(request, self.max_model_len)
-                            if stopped:
-                                ff_tokens = ff_tokens[: i + 1]
-                                break
-                        self.pending_ff_tokens[req_id] = ff_tokens
+                        ff_tokens, stopped = (
+                            self._update_request_with_output(
+                                request, ff_tokens))
+                        new_token_ids.extend(ff_tokens)
+
+                        if not stopped:
+                            self.pending_ff_tokens[req_id] = ff_tokens
 
                         # Extend logprobs for ff_tokens: each is
                         # deterministic (logprob=0, all others=-inf),
@@ -1484,10 +1463,15 @@ class Scheduler(SchedulerInterface):
                         if new_logprobs is not None:
                             n = len(ff_tokens)
                             width = new_logprobs.logprob_token_ids.shape[1]
-                            ff_token_ids = np.zeros(
-                                (n, width),
-                                dtype=new_logprobs.logprob_token_ids.dtype,
-                            )
+                            # Column 0 = actual ff_token (logprob 0.0).
+                            # Columns 1+ = -1 placeholder with -inf
+                            # logprob.  We cannot use 0 (valid token)
+                            # or repeat the ff_token (would overwrite
+                            # the 0.0 logprob with -inf in the
+                            # downstream dict keyed by token_id).
+                            id_dtype = new_logprobs.logprob_token_ids.dtype
+                            ff_token_ids = np.full(
+                                (n, width), -1, dtype=id_dtype)
                             ff_token_ids[:, 0] = ff_tokens
                             ff_logprobs = np.full(
                                 (n, width),
@@ -1509,6 +1493,28 @@ class Scheduler(SchedulerInterface):
                                 ),
                                 None,
                             )
+
+            # Handle stop: capture finish reason, free resources,
+            # and mark request for removal from the running queue.
+            # Placed after jump-forward so that stops triggered by
+            # ff_tokens are also handled.
+            routed_experts = None
+            finish_reason = None
+            if stopped:
+                routed_experts = self._get_routed_experts(request)
+
+                # Capture finish_reason BEFORE _handle_stopped_request,
+                # which may reset the status to WAITING for streaming
+                # requests that continue.
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]

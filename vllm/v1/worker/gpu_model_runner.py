@@ -1354,7 +1354,13 @@ class GPUModelRunner(
             if ff_tokens and is_last_rank:
                 start_idx = self.input_batch.num_tokens_no_spec[req_index]
                 end_idx = start_idx + len(ff_tokens)
+                assert end_idx <= self.max_model_len, (
+                    "Jump-forward token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.max_model_len}"
+                )
                 self.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = ff_tokens
+                self.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
                 self.input_batch.num_tokens_no_spec[req_index] = end_idx
                 req_state.output_token_ids.extend(ff_tokens)
 
