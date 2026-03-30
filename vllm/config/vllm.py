@@ -774,6 +774,13 @@ class VllmConfig:
                     scope="local",
                 )
                 self.scheduler_config.async_scheduling = False
+            elif self.structured_outputs_config.enable_jump_decoding:
+                logger.warning_once(
+                    "Async scheduling is not compatible with jump-forward "
+                    "decoding and will be disabled.",
+                    scope="local",
+                )
+                self.scheduler_config.async_scheduling = False
             elif not executor_supports_async_sched:
                 logger.warning_once(
                     "Async scheduling will be disabled because it is not supported "

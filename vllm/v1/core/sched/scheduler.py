@@ -1448,9 +1448,15 @@ class Scheduler(SchedulerInterface):
                     ff_tokens = struct_output_request.grammar.advance_ff_tokens()
 
                     if ff_tokens:
+                        # Call Scheduler._update_request_with_output
+                        # directly (bypassing AsyncScheduler's override)
+                        # because ff_tokens have no corresponding
+                        # num_output_placeholders entry — the async
+                        # scheduler only increments that counter for
+                        # sampled tokens, not for grammar-forced tokens.
                         ff_tokens, stopped = (
-                            self._update_request_with_output(
-                                request, ff_tokens))
+                            Scheduler._update_request_with_output(
+                                self, request, ff_tokens))
                         new_token_ids.extend(ff_tokens)
 
                         if not stopped:
@@ -1463,33 +1469,37 @@ class Scheduler(SchedulerInterface):
                         if new_logprobs is not None:
                             n = len(ff_tokens)
                             width = new_logprobs.logprob_token_ids.shape[1]
-                            # Column 0 = actual ff_token (logprob 0.0).
-                            # Columns 1+ = -1 placeholder with -inf
-                            # logprob.  We cannot use 0 (valid token)
-                            # or repeat the ff_token (would overwrite
-                            # the 0.0 logprob with -inf in the
-                            # downstream dict keyed by token_id).
                             id_dtype = new_logprobs.logprob_token_ids.dtype
-                            ff_token_ids = np.full(
-                                (n, width), -1, dtype=id_dtype)
-                            ff_token_ids[:, 0] = ff_tokens
-                            ff_logprobs = np.full(
+                            # Tile the ff_token across all width columns.
+                            # The downstream dict (keyed by token_id)
+                            # collapses duplicates to a single entry
+                            # {ff_token: 0.0}, correctly reflecting that
+                            # the forced token has probability 1 and is
+                            # the only meaningful candidate.
+                            ff_token_ids = np.tile(
+                                np.array(ff_tokens,
+                                         dtype=id_dtype).reshape(n, 1),
+                                (1, width),
+                            )
+                            ff_logprobs = np.zeros(
                                 (n, width),
-                                -np.inf,
                                 dtype=new_logprobs.logprobs.dtype,
                             )
-                            ff_logprobs[:, 0] = 0.0
                             ff_ranks = np.zeros(
                                 n,
                                 dtype=new_logprobs.sampled_token_ranks.dtype,
                             )
                             new_logprobs = LogprobsLists(
                                 np.concatenate(
-                                    [new_logprobs.logprob_token_ids, ff_token_ids]
+                                    [new_logprobs.logprob_token_ids,
+                                     ff_token_ids]
                                 ),
-                                np.concatenate([new_logprobs.logprobs, ff_logprobs]),
                                 np.concatenate(
-                                    [new_logprobs.sampled_token_ranks, ff_ranks]
+                                    [new_logprobs.logprobs, ff_logprobs]
+                                ),
+                                np.concatenate(
+                                    [new_logprobs.sampled_token_ranks,
+                                     ff_ranks]
                                 ),
                                 None,
                             )
